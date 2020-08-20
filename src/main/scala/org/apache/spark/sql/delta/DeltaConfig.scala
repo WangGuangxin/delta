@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +20,12 @@ import java.util.{HashMap, Locale}
 
 import org.apache.spark.sql.delta.actions.{Metadata, Protocol}
 import org.apache.spark.sql.delta.metering.DeltaLogging
+import org.apache.spark.sql.delta.schema.{Invariants, SchemaUtils}
 
-import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.catalyst.util.{DateTimeConstants, IntervalUtils}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 case class DeltaConfig[T](
     key: String,
@@ -82,7 +84,7 @@ object DeltaConfigs extends DeltaLogging {
     val sInLowerCase = s.trim.toLowerCase(Locale.ROOT)
     val interval =
       if (sInLowerCase.startsWith("interval ")) sInLowerCase else "interval " + sInLowerCase
-    val cal = CalendarInterval.fromString(interval)
+    val cal = IntervalUtils.safeStringToInterval(UTF8String.fromString(interval))
     if (cal == null) {
       throw new IllegalArgumentException("Invalid interval: " + s)
     }
@@ -144,34 +146,12 @@ object DeltaConfigs extends DeltaLogging {
   }
 
   /**
-   * Verify that the protocol version of the table satisfies the version requirements of all the
-   * configurations to be set.
+   * Table properties for new tables can be specified through SQL Configurations using the
+   * `sqlConfPrefix`. This method checks to see if any of the configurations exist among the SQL
+   * configurations and merges them with the user provided configurations. User provided configs
+   * take precedence.
    */
-  def verifyProtocolVersionRequirements(
-      configurations: Map[String, String],
-      current: Protocol): Unit = {
-    configurations.foreach { config =>
-      val key = config._1.toLowerCase(Locale.ROOT).stripPrefix("delta.")
-      if (entries.containsKey(key) && entries.get(key).minimumProtocolVersion.isDefined) {
-        val required = entries.get(key).minimumProtocolVersion.get
-        if (current.minWriterVersion < required.minWriterVersion ||
-          current.minReaderVersion < required.minReaderVersion) {
-          throw new AnalysisException(
-            s"Setting the Delta config ${config._1} requires a protocol version of $required " +
-            s"or above, but the protocol version of the Delta table is $current. " +
-            s"Please upgrade the protocol version of the table before setting this config.")
-        }
-      }
-    }
-  }
-
-  /**
-   * Fetch global default values from SQLConf.
-   */
-  def mergeGlobalConfigs(
-      sqlConfs: SQLConf,
-      tableConf: Map[String, String],
-      protocol: Protocol): Map[String, String] = {
+  def mergeGlobalConfigs(sqlConfs: SQLConf, tableConf: Map[String, String]): Map[String, String] = {
     import collection.JavaConverters._
 
     val globalConfs = entries.asScala.flatMap { case (key, config) =>
@@ -182,9 +162,7 @@ object DeltaConfigs extends DeltaLogging {
       }
     }
 
-    val updatedConf = globalConfs.toMap ++ tableConf
-    verifyProtocolVersionRequirements(updatedConf, protocol)
-    updatedConf
+    globalConfs.toMap ++ tableConf
   }
 
   /**
@@ -211,6 +189,27 @@ object DeltaConfigs extends DeltaLogging {
     }
   }
 
+  def getMilliSeconds(i: CalendarInterval): Long = {
+    getMicroSeconds(i) / 1000L
+  }
+
+  private def getMicroSeconds(i: CalendarInterval): Long = {
+    assert(i.months == 0)
+    i.days * DateTimeConstants.MICROS_PER_DAY + i.microseconds
+  }
+
+  /**
+   * For configs accepting an interval, we require the user specified string must obey:
+   *
+   * - Doesn't use months or years, since an internal like this is not deterministic.
+   * - The microseconds parsed from the string value must be a non-negative value.
+   *
+   * The method returns whether a [[CalendarInterval]] satisfies the requirements.
+   */
+  def isValidIntervalConfigValue(i: CalendarInterval): Boolean = {
+    i.months == 0 && getMicroSeconds(i) >= 0
+  }
+
   /**
    * The shortest duration we have to keep delta files around before deleting them. We can only
    * delete delta files that are before a compaction. We may keep files beyond this duration until
@@ -220,7 +219,7 @@ object DeltaConfigs extends DeltaLogging {
     "logRetentionDuration",
     "interval 30 days",
     parseCalendarInterval,
-    i => i.microseconds > 0 && i.months == 0,
+    isValidIntervalConfigValue,
     "needs to be provided as a calendar interval such as '2 weeks'. Months " +
     "and years are not accepted. You may specify '365 days' for a year instead.")
 
@@ -231,7 +230,7 @@ object DeltaConfigs extends DeltaLogging {
     "sampleRetentionDuration",
     "interval 7 days",
     parseCalendarInterval,
-    i => i.microseconds > 0 && i.months == 0,
+    isValidIntervalConfigValue,
     "needs to be provided as a calendar interval such as '2 weeks'. Months " +
       "and years are not accepted. You may specify '365 days' for a year instead.")
 
@@ -244,7 +243,7 @@ object DeltaConfigs extends DeltaLogging {
     "checkpointRetentionDuration",
     "interval 2 days",
     parseCalendarInterval,
-    i => i.microseconds > 0 && i.months == 0,
+    isValidIntervalConfigValue,
     "needs to be provided as a calendar interval such as '2 weeks'. Months " +
       "and years are not accepted. You may specify '365 days' for a year instead.")
 
@@ -294,7 +293,7 @@ object DeltaConfigs extends DeltaLogging {
     "deletedFileRetentionDuration",
     "interval 1 week",
     parseCalendarInterval,
-    i => i.microseconds > 0 && i.months == 0,
+    isValidIntervalConfigValue,
     "needs to be provided as a calendar interval such as '2 weeks'. Months " +
     "and years are not accepted. You may specify '365 days' for a year instead.")
 
@@ -354,5 +353,12 @@ object DeltaConfigs extends DeltaLogging {
     _.toInt,
     a => a >= -1,
     "needs to be larger than or equal to -1.")
+
+  val SYMLINK_FORMAT_MANIFEST_ENABLED = buildConfig[Boolean](
+    s"${hooks.GenerateSymlinkManifest.CONFIG_NAME_ROOT}.enabled",
+    "false",
+    _.toBoolean,
+    _ => true,
+    "needs to be a boolean.")
 
 }
